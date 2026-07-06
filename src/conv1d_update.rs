@@ -70,7 +70,11 @@ kernel void causal_conv1d_update_fused_{ty}(
         win[K - 1u] = bx;
         float acc = 0.0f;
         for (uint j = 0u; j < K; ++j) {{ acc += wv[j] * win[j]; }}
-        orow[t] = {from_f32}({to_f32}(crow[t]) * acc);
+        // Round the conv output through the storage dtype before the C gate —
+        // the CUDA update kernel stores conv_out and torch's C-multiply reads
+        // the rounded tensor (no-op for float).
+        float conv_val = {to_f32}(({ty})acc);
+        orow[t] = {from_f32}({to_f32}(crow[t]) * conv_val);
         for (uint j = 0u; j + 1u < K; ++j) {{ win[j] = win[j + 1u]; }}
     }}
     for (uint j = 0u; j + 1u < K; ++j) {{ orow[T + j] = {from_f32}(win[j]); }}
@@ -171,7 +175,7 @@ fn cpu_ref_bf16_bx(
                 for j in 0..k {
                     acc += w[c * k + j] * win[j];
                 }
-                orow[t] = crow[t] * acc;
+                orow[t] = crow[t] * half::bf16::from_f32(acc).to_f32();
                 for j in 0..km1 {
                     win[j] = win[j + 1];
                 }

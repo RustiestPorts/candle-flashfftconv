@@ -38,11 +38,14 @@ production model path yet:
 - `monarch_conv_fused` — the full circular FFT conv `IFFT(FFT(u) ⊙ k_f)` in ONE
   tiled `simdgroup_matrix` dispatch (Apple's tensor-core analog of the CUDA wmma
   path), intermediates pinned in threadgroup memory.
-- `monarch_conv_fused_padded` — the **causal linear** convolution a sequence model
-  actually needs: a length-T signal in an N·L-point transform with the Hyena/H3
-  input/output gates fused at load/store. Semantics pinned by a direct
-  O(T²) causal-conv ground-truth test (time order is the 4-step column-major
-  flattening, t = c·N + r — the layout the MLX oracle's accuracy test uses).
+- `monarch_conv_fused_padded` — the **complete Hyena/H3 block operator in one
+  dispatch**: `in_gate → FFT → ⊙k_f → IFFT → +u·D → out_gate`, a length-T signal
+  in an N·L-point transform (causal linear conv, not circular), gates fused at
+  load/store, the per-head delta-tap skip read from the still-resident staged
+  input — every stage separated only by threadgroup barriers, nothing leaving
+  threadgroup memory. Semantics pinned by a direct O(T²) full-block ground-truth
+  test (time order is the 4-step column-major flattening, t = c·N + r — the
+  layout the MLX oracle's accuracy test uses).
 - `fused_fft_conv` / `butterfly_*` — the un-fused three-phase butterfly family
   (the scalar/tiered reference implementations the fused kernels are gated against).
 - `irfft`, `complex_mul_dd`, `FFTConvDd` — FFT plumbing including a

@@ -903,7 +903,8 @@ struct PaddedConvParams {
     uint B; uint H; uint N; uint L; uint Np; uint Lp;
     uint off_dLr; uint off_dLi; uint off_dNr; uint off_dNi; uint off_tw;
     uint off_idNr; uint off_idNi; uint off_idLr; uint off_idLi; uint off_itw;
-    uint T; uint gates; // gates bit0 = input gate present, bit1 = output gate present
+    uint T; uint gates; // bit0 input gate, bit1 output gate, bit2 u·D skip term
+    uint off_d;         // packed offset of D[H] when gates bit2 is set
 };
 
 kernel void monarch_fused_conv_padded_f32(
@@ -939,6 +940,7 @@ kernel void monarch_fused_conv_padded_f32(
     device const float* idLr= packed + p.off_idLr;
     device const float* idLi= packed + p.off_idLi;
     device const float* itw = packed + p.off_itw;
+    device const float* dvec = packed + p.off_d; // D[H], valid iff gates bit2
 
     // preamble: stage the length-T signal into ux[Np,Lp]. Time order is the
     // 4-step column-major flattening t = c*N + r (the transpose-flatten the
@@ -1083,6 +1085,9 @@ kernel void monarch_fused_conv_padded_f32(
                 uint t = gc * N + gr;
                 if (t < T) {
                     float v = (scratch[i] - scratch[64u + i]) * scale;
+                    // u·D delta-tap skip: ux still holds the STAGED (gated) input —
+                    // untouched since the preamble — so the skip is one multiply.
+                    if (p.gates & 4u) { v += ux[gr * Lp + gc] * dvec[bh % p.H]; }
                     if (p.gates & 2u) { v *= og[t]; }
                     ob[t] = v;
                 }
@@ -1120,11 +1125,11 @@ impl CustomOp3 for MonarchFusedConvPadded {
         let kf = contig_f32(ks, kl)?;
         let lay = pack_layout(n, l);
         let (np, lp) = (lay.np, lay.lp);
-        if packed.len() != lay.total {
+        let expected_packed = lay.total + if self.gates & 4 != 0 { h } else { 0 };
+        if packed.len() != expected_packed {
             candle_core::bail!(
-                "monarch fused conv padded: packed len {} != expected {}",
-                packed.len(),
-                lay.total
+                "monarch fused conv padded: packed len {} != expected {expected_packed}",
+                packed.len()
             );
         }
         let expected_g = 1 + (self.gates & 1) as usize + ((self.gates >> 1) & 1) as usize;
@@ -1133,6 +1138,8 @@ impl CustomOp3 for MonarchFusedConvPadded {
                 "monarch fused conv padded: {g} input slots, gates flags expect {expected_g}"
             );
         }
+        let has_d = self.gates & 4 != 0;
+        let d_off = lay.total;
         let bh_stride = b * h * t_len;
         let og_slot = if self.gates & 1 != 0 { 2 } else { 1 };
         let scale = 1.0f32 / (n * l) as f32;
@@ -1248,6 +1255,10 @@ impl CustomOp3 for MonarchFusedConvPadded {
                             - ai[ni * l + k] * packed[lay.idli + k * lp + lo];
                     }
                     let mut v = sr * scale;
+                    if has_d {
+                        // Delta-tap skip on the staged (gated) input, per head.
+                        v += x[ni * l + lo] * packed[d_off + bh % h];
+                    }
                     if self.gates & 2 != 0 {
                         v *= u_ext[og_slot * bh_stride + bh * t_len + t];
                     }
@@ -1302,6 +1313,7 @@ impl CustomOp3 for MonarchFusedConvPadded {
             off_itw: u32,
             t: u32,
             gates: u32,
+            off_d: u32,
         }
         let params = PaddedConvParams {
             b: b as u32,
@@ -1322,6 +1334,7 @@ impl CustomOp3 for MonarchFusedConvPadded {
             off_itw: lay.itw as u32,
             t: t_len as u32,
             gates: self.gates,
+            off_d: lay.total as u32,
         };
 
         let dev = us.device();
@@ -1373,7 +1386,10 @@ impl CustomOp3 for MonarchFusedConvPadded {
 ///
 /// `u`/`in_gate`/`out_gate` are `[B,H,T]` real with `T ≤ N·L`; `k_f` `[…,N,L,2]`
 /// is the filter's forward Monarch FFT at the transform size (zero-pad the filter
-/// to `N·L` before `butterfly_fft_forward`). FFT conv is circular at `N·L`: choose
+/// to `N·L` before `butterfly_fft_forward`, laid out in the same column-major time
+/// order). `d` `[H]` is the optional per-head delta-tap skip `y += (u·in_gate)·D`
+/// (`fused_fft_conv`'s `u·D`, applied to the same input the conv sees), added
+/// before the output gate. FFT conv is circular at `N·L`: choose
 /// `N·L ≥ T + filter_len − 1` (e.g. `T = N·L/2` with a length-`T` filter) so wrap
 /// never reaches a stored output. Returns `[B,H,T]`.
 #[allow(clippy::too_many_arguments)]
@@ -1382,6 +1398,7 @@ pub fn monarch_conv_fused_padded(
     k_f: &Tensor,
     in_gate: Option<&Tensor>,
     out_gate: Option<&Tensor>,
+    d: Option<&Tensor>,
     d_f_n: &Tensor,
     d_f_l: &Tensor,
     twiddles: &Tensor,
@@ -1414,7 +1431,7 @@ pub fn monarch_conv_fused_padded(
     }
     let u_ext = Tensor::stack(&parts, 0)?.contiguous()?; // [G,B,H,T]
     let k_f = k_f.broadcast_as((b, h, n, l, 2))?.contiguous()?;
-    let packed = pack_full(
+    let mut packed = pack_full(
         &d_f_n.contiguous()?,
         &d_f_l.contiguous()?,
         &twiddles.contiguous()?,
@@ -1422,6 +1439,16 @@ pub fn monarch_conv_fused_padded(
         &id_f_l.contiguous()?,
         &ifft_twiddles.contiguous()?,
     )?;
+    if let Some(dv) = d {
+        if dv.dims1()? != h {
+            candle_core::bail!(
+                "monarch_conv_fused_padded: d has {} entries, expected H = {h}",
+                dv.dims1()?
+            );
+        }
+        gates |= 4;
+        packed = Tensor::cat(&[&packed, &dv.contiguous()?], 0)?;
+    }
     u_ext.apply_op3(&packed, &k_f, MonarchFusedConvPadded { n, l, gates })
 }
 
@@ -1489,7 +1516,7 @@ mod tests {
             let k_f = butterfly_fft_forward(&kt, &dfn, &dfl, &tw).unwrap();
 
             let fused: Vec<f32> = monarch_conv_fused_padded(
-                &ut, &k_f, Some(&git), Some(&got), &dfn, &dfl, &tw, &idfn, &idfl, &itw,
+                &ut, &k_f, Some(&git), Some(&got), None, &dfn, &dfl, &tw, &idfn, &idfl, &itw,
             )
             .unwrap()
             .flatten_all()
@@ -1536,11 +1563,11 @@ mod tests {
         }
     }
 
-    /// Ground truth: with T = N·L/2 and a length-T filter, the padded path IS the
-    /// causal linear convolution `out[t] = Σ_{s≤t} k[s]·u[t−s]` — pinning both the
-    /// t = r·L + c time order and the no-wrap padding contract.
+    /// Ground truth for the FULL fused block: with T = N·L/2 and a length-T filter,
+    /// `out[t] = ( Σ_{s≤t} k[s]·ug[t−s] + ug[t]·D_h ) · out_gate[t]` with
+    /// `ug = u·in_gate` — the complete Hyena/H3 operator, one dispatch.
     #[test]
-    fn fused_padded_is_causal_linear_conv() {
+    fn fused_padded_full_block_is_causal_linear_conv() {
         let dev = Device::Cpu;
         let (b, h, n, l) = (1usize, 2, 16, 8);
         let m = n * l;
@@ -1561,9 +1588,10 @@ mod tests {
             .unwrap();
         let k_f = butterfly_fft_forward(&kt, &dfn, &dfl, &tw).unwrap();
 
-        let got: Vec<f32> =
-            monarch_conv_fused_padded(&ut, &k_f, None, None, &dfn, &dfl, &tw, &idfn, &idfl, &itw)
-                .unwrap()
+        let got: Vec<f32> = monarch_conv_fused_padded(
+            &ut, &k_f, None, None, None, &dfn, &dfl, &tw, &idfn, &idfl, &itw,
+        )
+        .unwrap()
                 .flatten_all()
                 .unwrap()
                 .to_vec1()
@@ -1604,8 +1632,14 @@ mod tests {
             let (dfn, dfl, tw, idfn, idfl, itw) = mats(n, l, d);
             let kt = Tensor::from_vec(kf_sig.clone(), (1, 1, n, l), d).unwrap();
             let k_f = butterfly_fft_forward(&kt, &dfn, &dfl, &tw).unwrap();
+            let dt = Tensor::from_vec(
+                (0..h).map(|i| 0.1 + 0.05 * i as f32).collect::<Vec<f32>>(),
+                (h,),
+                d,
+            )
+            .unwrap();
             monarch_conv_fused_padded(
-                &ut, &k_f, Some(&git), Some(&got), &dfn, &dfl, &tw, &idfn, &idfl, &itw,
+                &ut, &k_f, Some(&git), Some(&got), Some(&dt), &dfn, &dfl, &tw, &idfn, &idfl, &itw,
             )
             .unwrap()
             .flatten_all()

@@ -100,5 +100,7 @@ pub use dd_complex_mul::complex_mul_dd;
 pub use dw3::depthwise3_causal;
 pub use fused_fft_conv::{fused_fft_conv, FusedFftConv};
 pub use fused_fft_conv_dd::{fused_fft_conv_dd, FusedFftConvDd};
-pub use fused_monarch::{butterfly_fft_forward_fused, monarch_conv_fused, warmup};
+pub use fused_monarch::{
+    butterfly_fft_forward_fused, monarch_conv_fused, monarch_conv_fused_padded, warmup,
+};
 pub use irfft::{irfft, irfft_dd, FftNorm};

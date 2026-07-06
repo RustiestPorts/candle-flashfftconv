@@ -30,13 +30,21 @@ use candle_flashfftconv::depthwise_conv1d_stream;
 let (y, new_cache) = depthwise_conv1d_stream(&x, &w, cache.as_ref())?;
 ```
 
-## Experimental surface
+## Monarch long-conv surface
 
 The FlashFFTConv research zoo, ported and differentially tested but not used by a
 production model path yet:
 
-- `fused_fft_conv` / `fused_monarch` / `butterfly_*` — the Monarch-decomposed FFT
-  long-conv family.
+- `monarch_conv_fused` — the full circular FFT conv `IFFT(FFT(u) ⊙ k_f)` in ONE
+  tiled `simdgroup_matrix` dispatch (Apple's tensor-core analog of the CUDA wmma
+  path), intermediates pinned in threadgroup memory.
+- `monarch_conv_fused_padded` — the **causal linear** convolution a sequence model
+  actually needs: a length-T signal in an N·L-point transform with the Hyena/H3
+  input/output gates fused at load/store. Semantics pinned by a direct
+  O(T²) causal-conv ground-truth test (time order is the 4-step column-major
+  flattening, t = c·N + r — the layout the MLX oracle's accuracy test uses).
+- `fused_fft_conv` / `butterfly_*` — the un-fused three-phase butterfly family
+  (the scalar/tiered reference implementations the fused kernels are gated against).
 - `irfft`, `complex_mul_dd`, `FFTConvDd` — FFT plumbing including a
   **double-double** (~quad-precision from paired f32) toolkit for accumulating
   long FFTs on Metal, where f64 doesn't exist.
